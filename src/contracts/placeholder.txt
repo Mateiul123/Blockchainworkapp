@@ -1,0 +1,2 @@
+This is a placeholder file to ensure the contracts directory exists.
+It will be accompanied by Counter.json and addresses.json after running the deploy script.
