@@ -5,349 +5,396 @@ import "./ITaskMarketplace.sol";
 import "./TaskLibrary.sol";
 
 /**
- * @title TaskMarketplace
- * @dev A decentralized task marketplace where users can create and complete tasks for ETH rewards
- * 
- * Requirements covered:
- * - Mappings and address types (tasks, tasksByCreator, tasksByWorker)
- * - Events (TaskCreated, TaskTaken, TaskCompleted, TaskCancelled)
- * - Modifiers (onlyTaskCreator, taskExists, onlyOwner)
- * - Function types (external, public, internal, pure, view)
- * - ETH transfers (payable functions, transfer to workers)
- * - Interface implementation (ITaskMarketplace)
- * - Library usage (TaskLibrary)
- * - Contract interaction (can be extended with other contracts)
+ * @title TaskMarketplace V2
+ * @dev Job/Task marketplace with applications, deadlines, escrow + auto-approval, comments (IPFS), ratings.
  */
 contract TaskMarketplace is ITaskMarketplace {
     using TaskLibrary for *;
-    
-    // State variables demonstrating Solidity-specific types
-    mapping(uint256 => Task) private tasks; // mapping: taskId => Task
-    mapping(address => uint256[]) private tasksByCreator; // mapping: creator => taskIds
-    mapping(address => uint256[]) private tasksByWorker; // mapping: worker => taskIds
-    mapping(address => uint256) private userBalances; // Withdrawal pattern
-    
-    address public owner; // address type
+
+    // -------- Storage --------
+    mapping(uint256 => Task) private tasks;
+    mapping(address => uint256[]) private tasksByCreator;
+    mapping(address => uint256[]) private tasksByWorker;
+
+    // Applicants
+    mapping(uint256 => address[]) private applicants;
+    mapping(uint256 => mapping(address => bool)) private hasApplied;
+
+    // Ratings
+    mapping(address => RatingInfo) private ratings;
+    mapping(uint256 => bool) private workerRated;
+    mapping(uint256 => bool) private creatorRated;
+
+    // Withdrawal pattern
+    mapping(address => uint256) private userBalances;
+
+    address public owner;
     uint256 private taskCounter;
     uint256 public platformFeeBalance;
-    
-    // Modifier examples
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this");
-        _;
-    }
-    
+
+    event TaskComment(
+    uint256 indexed taskId,
+    address indexed author,
+    string message,
+    uint256 timestamp
+);
+
+
+    // -------- Modifiers --------
     modifier taskExists(uint256 taskId) {
         require(taskId > 0 && taskId <= taskCounter, "Task does not exist");
         _;
     }
-    
-    modifier onlyTaskCreator(uint256 taskId) {
-        require(tasks[taskId].creator == msg.sender, "Only task creator can call this");
+
+    modifier onlyCreator(uint256 taskId) {
+        require(tasks[taskId].creator == msg.sender, "Only creator");
         _;
     }
-    
+
     modifier onlyWorker(uint256 taskId) {
-        require(tasks[taskId].worker == msg.sender, "Only assigned worker can call this");
+        require(tasks[taskId].worker == msg.sender, "Only assigned worker");
         _;
     }
-    
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
     constructor() {
         owner = msg.sender;
-        taskCounter = 0;
     }
-    
-    /**
-     * @dev External payable function to create a task with ETH reward
-     * Demonstrates: external, payable, ETH transfers, events, library usage
-     */
+
+    // -------- Core --------
     function createTask(
         string calldata title,
-        string calldata description,
-        uint256 deadline
+        string calldata metadataCID,
+        uint8 category,
+        bytes32 tagsHash,
+        uint256 applyDeadline,
+        uint256 deliveryDeadline
     ) external payable override returns (uint256) {
-        // Using library for validation (pure function)
-        TaskLibrary.validateTaskCreation(title, description, msg.value, deadline);
-        
+        TaskLibrary.validateTaskCreation(title, metadataCID, msg.value, applyDeadline, deliveryDeadline, category);
+
         taskCounter++;
-        
-        Task memory newTask = Task({
+
+        Task memory t = Task({
             id: taskCounter,
             creator: msg.sender,
             worker: address(0),
             title: title,
-            description: description,
+            metadataCID: metadataCID,
+            submissionCID: "",
             reward: msg.value,
             status: TaskStatus.Open,
             createdAt: block.timestamp,
-            deadline: deadline
+            applyDeadline: applyDeadline,
+            deliveryDeadline: deliveryDeadline,
+            reviewDeadline: 0,
+            acceptedAt: 0,
+            completedAt: 0,
+            category: Category(category),
+            tagsHash: tagsHash
         });
-        
-        tasks[taskCounter] = newTask;
+
+        tasks[taskCounter] = t;
         tasksByCreator[msg.sender].push(taskCounter);
-        
-        emit TaskCreated(taskCounter, msg.sender, msg.value, deadline);
-        
+
+        emit TaskCreated(taskCounter, msg.sender, msg.value, applyDeadline, deliveryDeadline, category, tagsHash, metadataCID);
+
         return taskCounter;
     }
-    
-    /**
-     * @dev External function to take an available task
-     * Demonstrates: external, state changes, events, library usage
-     */
-    function takeTask(uint256 taskId) external override taskExists(taskId) {
-        Task storage task = tasks[taskId];
-        
-        // Using library for validation
-        TaskLibrary.canTakeTask(
-            task.status,
-            task.creator,
-            task.worker,
-            msg.sender
-        );
-        
-        require(block.timestamp < task.deadline, "Task deadline has passed");
-        
-        task.worker = msg.sender;
-        task.status = TaskStatus.InProgress;
-        tasksByWorker[msg.sender].push(taskId);
-        
-        emit TaskTaken(taskId, msg.sender);
+
+    function applyToTask(uint256 taskId) external override taskExists(taskId) {
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.Open, "Not open");
+        require(block.timestamp <= t.applyDeadline, "Apply deadline passed");
+        require(msg.sender != t.creator, "Creator cannot apply");
+        require(!hasApplied[taskId][msg.sender], "Already applied");
+
+        hasApplied[taskId][msg.sender] = true;
+        applicants[taskId].push(msg.sender);
+
+        emit TaskApplied(taskId, msg.sender);
     }
-    
-    /**
-     * @dev External function to submit work for a task
-     * Worker calls this when they've completed the work
-     * Task goes to PendingApproval status
-     */
-    function submitWork(uint256 taskId) 
-        external 
-        override 
-        taskExists(taskId) 
-        onlyWorker(taskId) 
+
+    function getApplicants(uint256 taskId)
+        external
+        view
+        override
+        taskExists(taskId)
+        returns (address[] memory)
     {
-        Task storage task = tasks[taskId];
-        require(task.status == TaskStatus.InProgress, "Task is not in progress");
-        
-        task.status = TaskStatus.PendingApproval;
-        emit WorkSubmitted(taskId, msg.sender);
+        return applicants[taskId];
     }
-    
-    /**
-     * @dev External function for task creator to approve completed work
-     * Creator calls this to approve work and release payment to worker
-     * Part 2: ETH transfers - worker receives the reward here
-     */
-    function approveWork(uint256 taskId) 
-        external 
-        override 
-        taskExists(taskId) 
-        onlyTaskCreator(taskId) 
+
+    function acceptWorker(uint256 taskId, address worker)
+        external
+        override
+        taskExists(taskId)
+        onlyCreator(taskId)
     {
-        Task storage task = tasks[taskId];
-        require(task.status == TaskStatus.PendingApproval, "Work has not been submitted");
-        require(task.worker != address(0), "No worker assigned");
-        
-        task.status = TaskStatus.Completed;
-        
-        // Calculate payments using library (pure functions)
-        uint256 platformFee = TaskLibrary.calculatePlatformFee(task.reward);
-        uint256 workerPayment = TaskLibrary.calculateWorkerPayment(task.reward);
-        
-        platformFeeBalance += platformFee;
-        
-        // ETH transfer to worker (Withdrawal Pattern)
-        userBalances[task.worker] += workerPayment;
-        
-        emit TaskApproved(taskId, task.creator, task.worker, workerPayment);
-        emit TaskCompleted(taskId, task.worker, workerPayment);
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.Open, "Not open");
+        require(block.timestamp <= t.applyDeadline, "Apply deadline passed");
+        require(worker != address(0), "Invalid worker");
+        require(hasApplied[taskId][worker], "Worker did not apply");
+
+        t.worker = worker;
+        t.status = TaskStatus.InProgress;
+        t.acceptedAt = block.timestamp;
+
+        tasksByWorker[worker].push(taskId);
+
+        emit WorkerAccepted(taskId, msg.sender, worker);
     }
-    
-    /**
-     * @dev External function to complete a task and transfer reward
-     * DEPRECATED: Use submitWork() then approveWork() for escrow
-     * Kept for backwards compatibility
-     */
-    function completeTask(uint256 taskId) 
-        external 
-        override 
-        taskExists(taskId) 
-        onlyWorker(taskId) 
+
+    function submitWork(uint256 taskId, string calldata submissionCID)
+        external
+        override
+        taskExists(taskId)
+        onlyWorker(taskId)
     {
-        Task storage task = tasks[taskId];
-        
-        require(task.status == TaskStatus.InProgress, "Task is not in progress");
-        require(task.worker != address(0), "No worker assigned");
-        
-        // Submit work instead
-        task.status = TaskStatus.PendingApproval;
-        emit WorkSubmitted(taskId, msg.sender);
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.InProgress, "Not in progress");
+        require(block.timestamp <= t.deliveryDeadline, "Delivery deadline passed");
+        require(bytes(submissionCID).length > 0, "submissionCID required");
+
+        t.status = TaskStatus.PendingApproval;
+        t.submissionCID = submissionCID;
+
+        uint256 reviewDeadline = block.timestamp + TaskLibrary.reviewPeriod();
+        t.reviewDeadline = reviewDeadline;
+
+        emit WorkSubmitted(taskId, msg.sender, submissionCID, reviewDeadline);
     }
-    
-    /**
-     * @dev External function to cancel a task and refund creator
-     * Demonstrates: external, ETH transfers, events, modifiers
-     */
-    function cancelTask(uint256 taskId) 
-        external 
-        override 
-        taskExists(taskId) 
-        onlyTaskCreator(taskId) 
+
+    function approveWork(uint256 taskId)
+        external
+        override
+        taskExists(taskId)
+        onlyCreator(taskId)
     {
-        Task storage task = tasks[taskId];
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.PendingApproval, "Not pending approval");
+        require(t.worker != address(0), "No worker");
+
+        _finalizePayout(taskId, false);
+    }
+
+    function autoApprove(uint256 taskId)
+        external
+        override
+        taskExists(taskId)
+    {
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.PendingApproval, "Not pending approval");
+        require(t.reviewDeadline != 0, "No review deadline set");
+        require(block.timestamp > t.reviewDeadline, "Review period not over");
+
+        _finalizePayout(taskId, true);
+    }
+
+    function _finalizePayout(uint256 taskId, bool isAuto) internal {
+        Task storage t = tasks[taskId];
+
+        t.status = TaskStatus.Completed;
+        t.completedAt = block.timestamp;
+
+        uint256 fee = TaskLibrary.calculatePlatformFee(t.reward);
+        uint256 workerPay = TaskLibrary.calculateWorkerPayment(t.reward);
+
+        platformFeeBalance += fee;
+        userBalances[t.worker] += workerPay;
+
+        if (isAuto) {
+            emit WorkAutoApproved(taskId, msg.sender, t.worker, workerPay);
+        } else {
+            emit WorkApproved(taskId, t.creator, t.worker, workerPay);
+        }
+    }
+
+    function cancelTask(uint256 taskId)
+        external
+        override
+        taskExists(taskId)
+        onlyCreator(taskId)
+    {
+        Task storage t = tasks[taskId];
         require(
-            task.status == TaskStatus.Open || task.status == TaskStatus.InProgress,
-            "Task cannot be cancelled"
+            t.status == TaskStatus.Open || t.status == TaskStatus.InProgress,
+            "Cannot cancel now"
         );
-        
-        task.status = TaskStatus.Cancelled;
-        
-        // Refund creator using Withdrawal Pattern
-        userBalances[task.creator] += task.reward;
-        
+
+        t.status = TaskStatus.Cancelled;
+        userBalances[t.creator] += t.reward;
+
         emit TaskCancelled(taskId);
     }
-    
+
     /**
-     * @dev External view function to get task details
-     * Demonstrates: external, view (read-only)
+     * @dev Anyone can mark an open/inprogress task as expired after deadline, freeing logic for refunds.
+     * - If Open and applyDeadline passed -> expire + refund creator
+     * - If InProgress and deliveryDeadline passed -> expire + refund creator (you can change this policy if you want)
      */
-    function getTask(uint256 taskId) 
-        external 
-        view 
-        override 
-        taskExists(taskId) 
-        returns (Task memory) 
+    function expireTask(uint256 taskId)
+        external
+        override
+        taskExists(taskId)
+    {
+        Task storage t = tasks[taskId];
+        require(
+            t.status == TaskStatus.Open || t.status == TaskStatus.InProgress,
+            "Not expirable"
+        );
+
+        bool canExpire =
+            (t.status == TaskStatus.Open && block.timestamp > t.applyDeadline) ||
+            (t.status == TaskStatus.InProgress && block.timestamp > t.deliveryDeadline);
+
+        require(canExpire, "Not past deadline");
+
+        t.status = TaskStatus.Expired;
+        userBalances[t.creator] += t.reward;
+
+        emit TaskExpired(taskId);
+    }
+
+    function addComment(uint256 taskId, string calldata message)
+        external
+        taskExists(taskId)
+    {
+        require(bytes(message).length > 0, "Empty message");
+        require(bytes(message).length <= 500, "Message too long");
+
+        Task storage t = tasks[taskId];
+
+        require(
+            msg.sender == t.creator || msg.sender == t.worker,
+            "Only creator or worker can comment"
+        );
+
+        emit TaskComment(taskId, msg.sender, message, block.timestamp);
+    }
+
+
+
+    // -------- Ratings --------
+    function rateWorker(uint256 taskId, uint8 stars)
+        external
+        override
+        taskExists(taskId)
+        onlyCreator(taskId)
+    {
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.Completed, "Not completed");
+        require(!workerRated[taskId], "Already rated worker");
+        require(stars >= 1 && stars <= 5, "Stars 1..5");
+
+        workerRated[taskId] = true;
+
+        RatingInfo storage r = ratings[t.worker];
+        r.totalStars += stars;
+        r.count += 1;
+
+        emit Rated(taskId, msg.sender, t.worker, stars);
+    }
+
+    function rateCreator(uint256 taskId, uint8 stars)
+        external
+        override
+        taskExists(taskId)
+        onlyWorker(taskId)
+    {
+        Task storage t = tasks[taskId];
+        require(t.status == TaskStatus.Completed, "Not completed");
+        require(!creatorRated[taskId], "Already rated creator");
+        require(stars >= 1 && stars <= 5, "Stars 1..5");
+
+        creatorRated[taskId] = true;
+
+        RatingInfo storage r = ratings[t.creator];
+        r.totalStars += stars;
+        r.count += 1;
+
+        emit Rated(taskId, msg.sender, t.creator, stars);
+    }
+
+    function getRating(address user)
+        external
+        view
+        override
+        returns (uint256 avgStarsTimes100, uint32 count)
+    {
+        RatingInfo memory r = ratings[user];
+        if (r.count == 0) return (0, 0);
+        // avg * 100 (ex: 4.25 -> 425)
+        uint256 avg100 = (uint256(r.totalStars) * 100) / uint256(r.count);
+        return (avg100, r.count);
+    }
+
+    // -------- Views --------
+    function getTask(uint256 taskId)
+        external
+        view
+        override
+        taskExists(taskId)
+        returns (Task memory)
     {
         return tasks[taskId];
     }
-    
-    /**
-     * @dev External view function to get all tasks by creator
-     * Demonstrates: external, view
-     */
-    function getTasksByCreator(address creator) 
-        external 
-        view 
-        override 
-        returns (uint256[] memory) 
+
+    function getTasksByCreator(address creator)
+        external
+        view
+        override
+        returns (uint256[] memory)
     {
         return tasksByCreator[creator];
     }
-    
-    /**
-     * @dev External view function to get all tasks by worker
-     * Demonstrates: external, view
-     */
-    function getTasksByWorker(address worker) 
-        external 
-        view 
-        override 
-        returns (uint256[] memory) 
+
+    function getTasksByWorker(address worker)
+        external
+        view
+        override
+        returns (uint256[] memory)
     {
         return tasksByWorker[worker];
     }
-    
-    /**
-     * @dev Public view function to get all open tasks
-     * Demonstrates: public, view, array manipulation
-     */
-    function getAllOpenTasks() public view returns (Task[] memory) {
-        uint256 openCount = 0;
-        
-        // Count open tasks
-        for (uint256 i = 1; i <= taskCounter; i++) {
-            if (tasks[i].status == TaskStatus.Open) {
-                openCount++;
-            }
-        }
-        
-        // Create array of open tasks
-        Task[] memory openTasks = new Task[](openCount);
-        uint256 index = 0;
-        
-        for (uint256 i = 1; i <= taskCounter; i++) {
-            if (tasks[i].status == TaskStatus.Open) {
-                openTasks[index] = tasks[i];
-                index++;
-            }
-        }
-        
-        return openTasks;
-    }
-    
-    /**
-     * @dev External function to withdraw available balance (Withdrawal Pattern)
-     * Demonstrates: external, ETH transfers, security pattern
-     */
-    function withdraw() external {
-        uint256 amount = userBalances[msg.sender];
-        require(amount > 0, "No balance to withdraw");
-        
-        userBalances[msg.sender] = 0;
-        
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        require(success, "Transfer failed");
-    }
-    
-    /**
-     * @dev External view function to get user's withdrawable balance
-     * Demonstrates: external, view
-     */
-    function getBalance(address user) external view returns (uint256) {
-        return userBalances[user];
-    }
-    
-    /**
-     * @dev External function for owner to withdraw platform fees
-     * Demonstrates: external, onlyOwner modifier, ETH transfers
-     */
-    function withdrawPlatformFees() external onlyOwner {
-        uint256 amount = platformFeeBalance;
-        require(amount > 0, "No fees to withdraw");
-        
-        platformFeeBalance = 0;
-        
-        (bool success, ) = payable(owner).call{value: amount}("");
-        require(success, "Transfer failed");
-    }
-    
-    /**
-     * @dev Public pure function to get platform fee percentage
-     * Demonstrates: public, pure (no state access)
-     */
-    function getPlatformFeePercentage() public pure returns (uint256) {
-        return 2; // 2%
-    }
-    
-    /**
-     * @dev Public view function to get total number of tasks
-     * Demonstrates: public, view
-     */
-    function getTotalTasks() public view returns (uint256) {
+
+    function getTotalTasks() external view override returns (uint256) {
         return taskCounter;
     }
-    
-    /**
-     * @dev Internal pure function example
-     * Demonstrates: internal, pure
-     */
-    function _isValidAddress(address addr) internal pure returns (bool) {
-        return addr != address(0);
+
+    // -------- Withdrawals --------
+    function withdraw() external override {
+        uint256 amount = userBalances[msg.sender];
+        require(amount > 0, "No balance");
+        userBalances[msg.sender] = 0;
+
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Transfer failed");
     }
-    
-    /**
-     * @dev Receive function to accept ETH
-     * Demonstrates: special function, payable
-     */
+
+    function getBalance(address user) external view override returns (uint256) {
+        return userBalances[user];
+    }
+
+    // -------- Owner fees --------
+    function withdrawPlatformFees() external onlyOwner {
+        uint256 amount = platformFeeBalance;
+        require(amount > 0, "No fees");
+        platformFeeBalance = 0;
+
+        (bool ok, ) = payable(owner).call{value: amount}("");
+        require(ok, "Fee transfer failed");
+    }
+
+    // -------- Receive/fallback --------
     receive() external payable {
         platformFeeBalance += msg.value;
     }
-    
-    /**
-     * @dev Fallback function
-     * Demonstrates: special function, payable
-     */
+
     fallback() external payable {
         platformFeeBalance += msg.value;
     }
