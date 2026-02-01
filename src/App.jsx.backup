@@ -5,7 +5,7 @@ import { initIPFS } from "./utils/ipfsUtils";
 import "./App.css";
 
 // ✅ update this after deploy
-const SEPOLIA_CONTRACT_ADDRESS = "0x5D533ccf3765aeba0d5bdfeBfc08AdD1AECBb8C5"; // ✅ V2 Contract
+const SEPOLIA_CONTRACT_ADDRESS = "0xB12210a69c508AaA54504908e09c5a4383f026c8";
 const SEPOLIA_CHAIN_ID = "11155111";
 
 // status mapping must match your contract enum order
@@ -34,8 +34,8 @@ export default function App() {
 
   // ui state
   const [currentView, setCurrentView] = useState("marketplace"); // marketplace | myTasks | create | taskDetail
-  const [selectedTaskId, setSelectedTaskId] = useState(null);
-  const [selectedTask, setSelectedTask] = useState(null);
+  const [selectedTaskId, setSelectedTaskId] = useState(null); // for task detail view
+  const [selectedTask, setSelectedTask] = useState(null); // full task object
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -60,15 +60,6 @@ export default function App() {
   // ✅ File uploads state
   const [attachments, setAttachments] = useState([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
-
-  // ✅ Gas estimation modal state
-  const [gasModal, setGasModal] = useState({
-    show: false,
-    action: "",
-    gasEstimate: null,
-    onConfirm: null,
-  });
-  const [estimatingGas, setEstimatingGas] = useState(false);
 
   // init utils
   useEffect(() => {
@@ -390,19 +381,14 @@ export default function App() {
     e.preventDefault();
     if (!utils) return;
 
-    // ✅ First, estimate gas and show modal
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: "Create Task",
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
     try {
       const deadlineTimestamp = Math.floor(new Date(newTask.deadline).getTime() / 1000);
 
-      // Upload attachments first if needed (for accurate gas estimation)
+      // ✅ Upload attachments to IPFS first if any exist
       let attachmentCIDs = [];
       if (attachments.length > 0) {
         setUploadingFiles(true);
@@ -415,83 +401,49 @@ export default function App() {
             type: file.type,
             cid: attachments.length === 1 ? cid : `${cid}/${file.name}`,
           }));
+          console.log("Files uploaded to IPFS:", attachmentCIDs);
         } catch (uploadErr) {
+          console.error("File upload failed:", uploadErr);
           setError(`File upload failed: ${uploadErr.message}`);
+          setLoading(false);
           setUploadingFiles(false);
-          setEstimatingGas(false);
-          setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
           return;
         }
         setUploadingFiles(false);
       }
 
-      // Estimate gas
-      const gasEstimate = await utils.estimateGasForCreateTask(
+      // ✅ IPFS upload happens automatically in utils.createTask, now with attachments
+      const res = await utils.createTask(
         newTask.title,
         newTask.description,
         deadlineTimestamp,
         newTask.reward,
-        { attachments: attachmentCIDs }
+        { attachments: attachmentCIDs } // Pass attachments metadata
       );
 
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+      if (!res.success) {
+        setError(res.error);
+        setLoading(false);
         return;
       }
 
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: "Create Task",
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
+      const msg = `Task created${res.taskId != null ? ` (#${res.taskId})` : ""}!`;
+      const ipfsInfo = res.metadataCID ? ` (Metadata: ${res.metadataCID})` : "";
+      const filesInfo = attachmentCIDs.length > 0 ? ` (${attachmentCIDs.length} file${attachmentCIDs.length > 1 ? 's' : ''} attached)` : "";
+      setSuccess(msg + ipfsInfo + filesInfo);
+      clearMessagesSoon();
 
-          try {
-            // Execute transaction using the already calculated metadataCID
-            const res = await utils.createTask(
-              newTask.title,
-              gasEstimate.metadataCID, // Use pre-uploaded metadata CID
-              deadlineTimestamp,
-              newTask.reward,
-              { attachments: attachmentCIDs }
-            );
+      setNewTask({ title: "", description: "", reward: "", deadline: "" });
+      setAttachments([]); // Clear attachments
+      setCurrentView("marketplace");
 
-            if (!res.success) {
-              setError(res.error);
-              setLoading(false);
-              return;
-            }
-
-            const msg = `Task created${res.taskId != null ? ` (#${res.taskId})` : ""}!`;
-            const ipfsInfo = res.metadataCID ? ` (Metadata: ${res.metadataCID})` : "";
-            const filesInfo = attachmentCIDs.length > 0 ? ` (${attachmentCIDs.length > 1 ? 's' : ''} file${attachmentCIDs.length > 1 ? 's' : ''} attached)` : "";
-            setSuccess(msg + ipfsInfo + filesInfo);
-            clearMessagesSoon();
-
-            setNewTask({ title: "", description: "", reward: "", deadline: "" });
-            setAttachments([]);
-            setCurrentView("marketplace");
-
-            await loadTasks(account);
-            await loadBalances(account);
-          } catch (err) {
-            setError(err?.message || String(err));
-          }
-
-          setLoading(false);
-        },
-      });
+      await loadTasks(account);
+      await loadBalances(account);
     } catch (err) {
       setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
     }
+
+    setLoading(false);
   };
 
   // ✅ Handle file selection
@@ -527,258 +479,98 @@ export default function App() {
   const handleTakeTask = async (taskId) => {
     if (!utils) return;
 
-    // ✅ Estimate gas first
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: `Take Task #${taskId}`,
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
-    try {
-      const gasEstimate = await utils.estimateGasForTakeTask(taskId);
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
-        return;
-      }
-
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: `Take Task #${taskId}`,
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
-
-          const res = await utils.takeTask(taskId);
-          if (res.success) {
-            setSuccess(`Task #${taskId} taken!`);
-            clearMessagesSoon();
-            await loadTasks(account);
-          } else {
-            setError(res.error);
-          }
-
-          setLoading(false);
-        },
-      });
-    } catch (err) {
-      setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+    const res = await utils.takeTask(taskId);
+    if (res.success) {
+      setSuccess(`Task #${taskId} taken!`);
+      clearMessagesSoon();
+      await loadTasks(account);
+    } else {
+      setError(res.error);
     }
+
+    setLoading(false);
   };
 
   const handleSubmitWork = async (taskId) => {
     if (!utils) return;
 
-    // ✅ Estimate gas first
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: `Submit Work for Task #${taskId}`,
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
-    try {
-      const gasEstimate = await utils.estimateGasForSubmitWork(taskId, "");
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
-        return;
-      }
-
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: `Submit Work for Task #${taskId}`,
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
-
-          const res = await utils.submitWork(taskId);
-          if (res.success) {
-            setSuccess(`Work submitted for Task #${taskId}. Waiting approval...`);
-            clearMessagesSoon();
-            await loadTasks(account);
-          } else {
-            setError(res.error);
-          }
-
-          setLoading(false);
-        },
-      });
-    } catch (err) {
-      setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+    const res = await utils.submitWork(taskId);
+    if (res.success) {
+      setSuccess(`Work submitted for Task #${taskId}. Waiting approval...`);
+      clearMessagesSoon();
+      await loadTasks(account);
+    } else {
+      setError(res.error);
     }
+
+    setLoading(false);
   };
 
   const handleApproveWork = async (taskId) => {
     if (!utils) return;
 
-    // ✅ Estimate gas first
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: `Approve Work for Task #${taskId}`,
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
-    try {
-      const gasEstimate = await utils.estimateGasForApproveWork(taskId);
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
-        return;
-      }
-
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: `Approve Work for Task #${taskId}`,
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
-
-          const res = await utils.approveWork(taskId);
-          if (res.success) {
-            setSuccess(`Approved Task #${taskId}. Worker can withdraw reward now.`);
-            clearMessagesSoon();
-            await loadTasks(account);
-            await loadBalances(account);
-          } else {
-            setError(res.error);
-          }
-
-          setLoading(false);
-        },
-      });
-    } catch (err) {
-      setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+    const res = await utils.approveWork(taskId);
+    if (res.success) {
+      setSuccess(`Approved Task #${taskId}. Worker can withdraw reward now.`);
+      clearMessagesSoon();
+      await loadTasks(account);
+      await loadBalances(account);
+    } else {
+      setError(res.error);
     }
+
+    setLoading(false);
   };
 
   const handleCancelTask = async (taskId) => {
     if (!utils) return;
 
-    // ✅ Estimate gas first
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: `Cancel Task #${taskId}`,
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
-    try {
-      const gasEstimate = await utils.estimateGasForCancelTask(taskId);
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
-        return;
-      }
-
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: `Cancel Task #${taskId}`,
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
-
-          const res = await utils.cancelTask(taskId);
-          if (res.success) {
-            setSuccess(`Task #${taskId} cancelled.`);
-            clearMessagesSoon();
-            await loadTasks(account);
-            await loadBalances(account);
-          } else {
-            setError(res.error);
-          }
-
-          setLoading(false);
-        },
-      });
-    } catch (err) {
-      setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+    const res = await utils.cancelTask(taskId);
+    if (res.success) {
+      setSuccess(`Task #${taskId} cancelled.`);
+      clearMessagesSoon();
+      await loadTasks(account);
+      await loadBalances(account);
+    } else {
+      setError(res.error);
     }
+
+    setLoading(false);
   };
 
   const handleWithdraw = async () => {
     if (!utils) return;
 
-    // ✅ Estimate gas first
-    setEstimatingGas(true);
-    setGasModal({
-      show: true,
-      action: `Withdraw ${withdrawable} ETH`,
-      gasEstimate: null,
-      onConfirm: null,
-    });
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
-    try {
-      const gasEstimate = await utils.estimateGasForWithdraw();
-      setEstimatingGas(false);
-
-      if (!gasEstimate.success) {
-        setError(`Gas estimation failed: ${gasEstimate.error}`);
-        setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
-        return;
-      }
-
-      // Show gas modal with confirmation callback
-      setGasModal({
-        show: true,
-        action: `Withdraw ${withdrawable} ETH`,
-        gasEstimate: gasEstimate,
-        onConfirm: async () => {
-          setLoading(true);
-          setError("");
-          setSuccess("");
-
-          const res = await utils.withdraw();
-          if (res.success) {
-            setSuccess("Withdrawal successful!");
-            clearMessagesSoon();
-            await loadBalances(account);
-          } else {
-            setError(res.error);
-          }
-
-          setLoading(false);
-        },
-      });
-    } catch (err) {
-      setError(err?.message || String(err));
-      setEstimatingGas(false);
-      setGasModal({ show: false, action: "", gasEstimate: null, onConfirm: null });
+    const res = await utils.withdraw();
+    if (res.success) {
+      setSuccess("Withdrawal successful!");
+      clearMessagesSoon();
+      await loadBalances(account);
+    } else {
+      setError(res.error);
     }
+
+    setLoading(false);
   };
 
   // optional: add comment (only if utils.addComment exists)
@@ -816,8 +608,6 @@ export default function App() {
     setLoading(true);
     const res = await utils.getTask(taskId);
     
-    console.log('Task detail loaded:', res.task); // Debug
-    
     if (res.success) {
       setSelectedTask(res.task);
       setSelectedTaskId(taskId);
@@ -852,9 +642,18 @@ export default function App() {
         <div className="connect-container">
           <h1>🎯 Task Marketplace</h1>
           <p>A decentralized task platform on Sepolia (escrow + approvals)</p>
+
           <button onClick={connectWallet} disabled={loading} className="btn-primary">
             {loading ? "Connecting..." : "Connect Wallet"}
           </button>
+
+          {error && <div className="error">{error}</div>}
+
+          {!SEPOLIA_CONTRACT_ADDRESS?.startsWith("0x") && (
+            <div className="warning">
+              ⚠️ Contract address not configured. Update SEPOLIA_CONTRACT_ADDRESS in App.jsx
+            </div>
+          )}
         </div>
       </div>
     );
@@ -862,92 +661,6 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* ✅ Gas Estimation Modal */}
-      {gasModal.show && (
-        <div className="modal-overlay" onClick={() => setGasModal({ ...gasModal, show: false })}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <h3>⛽ Transaction Details</h3>
-            
-            {estimatingGas ? (
-              <div className="gas-loading">
-                <p>Estimating gas cost...</p>
-              </div>
-            ) : gasModal.gasEstimate ? (
-              <>
-                <div className="gas-details">
-                  <div className="gas-row">
-                    <span className="gas-label">Action:</span>
-                    <span className="gas-value">{gasModal.action}</span>
-                  </div>
-                  
-                  {gasModal.gasEstimate.rewardEth && (
-                    <div className="gas-row">
-                      <span className="gas-label">Task Reward:</span>
-                      <span className="gas-value reward-highlight">{gasModal.gasEstimate.rewardEth} ETH</span>
-                    </div>
-                  )}
-                  
-                  <div className="gas-row">
-                    <span className="gas-label">Estimated Gas:</span>
-                    <span className="gas-value">{Number(gasModal.gasEstimate.gasEstimate).toLocaleString()} units</span>
-                  </div>
-                  
-                  <div className="gas-row">
-                    <span className="gas-label">Gas Price:</span>
-                    <span className="gas-value">{parseFloat(gasModal.gasEstimate.gasPrice).toFixed(2)} Gwei</span>
-                  </div>
-                  
-                  <div className="gas-row highlight">
-                    <span className="gas-label">Gas Cost:</span>
-                    <span className="gas-value">{parseFloat(gasModal.gasEstimate.gasCostEth).toFixed(6)} ETH</span>
-                  </div>
-                  
-                  {gasModal.gasEstimate.totalCostEth && (
-                    <div className="gas-row total">
-                      <span className="gas-label">Total Cost:</span>
-                      <span className="gas-value total-highlight">{gasModal.gasEstimate.totalCostEth} ETH</span>
-                    </div>
-                  )}
-                  
-                  <div className="gas-warning">
-                    ⚠️ Actual cost may vary based on network conditions
-                  </div>
-                </div>
-                
-                <div className="gas-actions">
-                  <button 
-                    className="btn-secondary" 
-                    onClick={() => setGasModal({ ...gasModal, show: false })}
-                  >
-                    Cancel
-                  </button>
-                  <button 
-                    className="btn-primary" 
-                    onClick={() => {
-                      setGasModal({ ...gasModal, show: false });
-                      gasModal.onConfirm?.();
-                    }}
-                    disabled={loading}
-                  >
-                    Confirm Transaction
-                  </button>
-                </div>
-              </>
-            ) : (
-              <div className="gas-error">
-                <p>❌ Failed to estimate gas</p>
-                <button 
-                  className="btn-secondary" 
-                  onClick={() => setGasModal({ ...gasModal, show: false })}
-                >
-                  Close
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       <div className="container">
         <header className="header">
           <h1>🎯 Task Marketplace</h1>
@@ -995,76 +708,6 @@ export default function App() {
           <div className="error">❌ Wrong network! Switch MetaMask to Sepolia (Chain ID 11155111).</div>
         )}
 
-        {/* ✅ Dashboard Statistics */}
-        {isConnected && !wrongNetwork && (
-          <div className="dashboard-stats">
-            <div className="stat-card">
-              <div className="stat-icon">📊</div>
-              <div className="stat-content">
-                <div className="stat-value">{myCreatedTasks.length}</div>
-                <div className="stat-label">Tasks Created</div>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon">💼</div>
-              <div className="stat-content">
-                <div className="stat-value">{myWorkerTasks.length}</div>
-                <div className="stat-label">Tasks Working</div>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon">💰</div>
-              <div className="stat-content">
-                <div className="stat-value">
-                  {myWorkerTasks
-                    .filter(t => t.status === STATUS.Completed)
-                    .reduce((sum, t) => sum + parseFloat(t.reward || 0), 0)
-                    .toFixed(3)} ETH
-                </div>
-                <div className="stat-label">Total Earned</div>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon">💸</div>
-              <div className="stat-content">
-                <div className="stat-value">
-                  {myCreatedTasks
-                    .reduce((sum, t) => sum + parseFloat(t.reward || 0), 0)
-                    .toFixed(3)} ETH
-                </div>
-                <div className="stat-label">Total Spent</div>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon">✅</div>
-              <div className="stat-content">
-                <div className="stat-value">
-                  {myCreatedTasks.length > 0
-                    ? Math.round(
-                        (myCreatedTasks.filter(t => t.status === STATUS.Completed).length /
-                          myCreatedTasks.length) *
-                          100
-                      )
-                    : 0}%
-                </div>
-                <div className="stat-label">Completion Rate</div>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon">🏪</div>
-              <div className="stat-content">
-                <div className="stat-value">{openTasks.length}</div>
-                <div className="stat-label">Open Tasks</div>
-              </div>
-            </div>
-          </div>
-        )}
-
         <nav className="nav">
           <button
             className={currentView === "marketplace" ? "active" : ""}
@@ -1096,7 +739,7 @@ export default function App() {
               <h2>Open Tasks</h2>
 
               <div className="filters-bar">
-                <div className="search-wrap">
+                <div className="search-wrap"></div>
                   <span className="search-icon">🔎</span>
                   <input
                     className="search-input"
@@ -1177,45 +820,30 @@ export default function App() {
 
                         <p className="description">{task.description}</p>
 
+                        {/* ✅ Display attachments if they exist */}
+                        {task.metadata?.attachments && task.metadata.attachments.length > 0 && (
+                          <div className="task-attachments">
+                            <h4>📎 Attachments</h4>
+                            <ul>
+                              {task.metadata.attachments.map((att, idx) => (
+                                <li key={idx}>
+                                  <span>📄 {att.name}</span>
+                                  <a 
+                                    href={`https://w3s.link/ipfs/${att.cid}`} 
+                                    target="_blank" 
+                                    rel="noopener noreferrer"
+                                  >
+                                    View
+                                  </a>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
                         <div className="task-meta">
                           <span>📅 Deadline: {formatDateTime(task.deadline)}</span>
                           <span>👤 Creator: {formatAddress(task.creator)}</span>
-                        </div>
-
-                        {/* Optional: COMMENTS (only shows send button if utils.addComment exists) */}
-                        <div className="comments">
-                          {(comments[task.id] || []).length === 0 ? (
-                            <div className="comments-empty">No comments yet</div>
-                          ) : (
-                            (comments[task.id] || []).map((c, i) => (
-                              <div key={i} className="comment">
-                                <b>{formatAddress(c.author)}</b>: {c.message}
-                              </div>
-                            ))
-                          )}
-
-                          <div className="comment-input">
-                            <input
-                              placeholder="Write a comment..."
-                              value={commentInput[task.id] || ""}
-                              onChange={(e) =>
-                                setCommentInput((prev) => ({
-                                  ...prev,
-                                  [task.id]: e.target.value,
-                                }))
-                              }
-                            />
-                            {utils?.addComment && (
-                              <button
-                                type="button"
-                                className="btn-small"
-                                disabled={loading || wrongNetwork}
-                                onClick={() => handleAddComment(task.id)}
-                              >
-                                Send
-                              </button>
-                            )}
-                          </div>
                         </div>
 
                         {isCreator ? (
@@ -1235,11 +863,10 @@ export default function App() {
                             Take Task
                           </button>
                         )}
-
                         <button
                           onClick={() => handleViewTask(task.id)}
-                          className="btn-secondary"
                           disabled={loading}
+                          className="btn-secondary"
                         >
                           View Details
                         </button>
@@ -1248,136 +875,6 @@ export default function App() {
                   })}
                 </div>
               )}
-            </div>
-          )}
-
-          {/* Task Detail */}
-          {currentView === "taskDetail" && selectedTask && (
-            <div className="task-detail">
-              <button onClick={handleBackFromDetail} className="btn-back">
-                ← Back to Marketplace
-              </button>
-
-              <h2>Task Details</h2>
-
-              <div className="task-card">
-                <div className="task-header">
-                  <h3>{selectedTask.title}</h3>
-                  <span className="reward">💰 {selectedTask.reward} ETH</span>
-                </div>
-
-                {/* ✅ Show description with fallback */}
-                <p className="description">
-                  {selectedTask.description || selectedTask.metadataCID || "No description available"}
-                </p>
-
-                {/* ✅ Show metadata CID info for debugging */}
-                {selectedTask.metadataCID && (
-                  <div style={{ fontSize: '0.85rem', color: '#888', marginBottom: '1rem' }}>
-                    Metadata CID: <a href={`https://gateway.pinata.cloud/ipfs/${selectedTask.metadataCID}`} target="_blank" rel="noopener noreferrer" style={{ color: '#ff6fb1' }}>
-                      {selectedTask.metadataCID}
-                    </a>
-                  </div>
-                )}
-
-                {/* ✅ Display attachments if they exist in metadata */}
-                {selectedTask.metadata?.attachments && selectedTask.metadata.attachments.length > 0 && (
-                  <div className="task-attachments">
-                    <h4>📎 Attachments ({selectedTask.metadata.attachments.length})</h4>
-                    <ul>
-                      {selectedTask.metadata.attachments.map((att, idx) => (
-                        <li key={idx}>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                              <span>📄 {att.name} ({formatFileSize(att.size)})</span>
-                              <a 
-                                href={`https://gateway.pinata.cloud/ipfs/${att.cid}`} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="btn-small"
-                              >
-                                View File
-                              </a>
-                            </div>
-                            {/* ✅ Show image preview if it's an image */}
-                            {att.type?.startsWith('image/') && (
-                              <img 
-                                src={`https://gateway.pinata.cloud/ipfs/${att.cid}`} 
-                                alt={att.name}
-                                style={{ 
-                                  maxWidth: '100%', 
-                                  maxHeight: '400px', 
-                                  borderRadius: '12px',
-                                  objectFit: 'contain',
-                                  border: '1px solid rgba(43,34,48,0.08)'
-                                }}
-                                onError={(e) => {
-                                  e.target.style.display = 'none';
-                                  console.error('Failed to load image:', att.cid);
-                                }}
-                              />
-                            )}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                <div className="task-meta">
-                  <span>📅 Deadline: {formatDateTime(selectedTask.deadline)}</span>
-                  <span>👤 Creator: {formatAddress(selectedTask.creator)}</span>
-                  {selectedTask.worker && selectedTask.worker !== ZERO_ADDR && (
-                    <span>👷 Worker: {formatAddress(selectedTask.worker)}</span>
-                  )}
-                  <span className={`status status-${selectedTask.statusText?.toLowerCase()}`}>
-                    Status: {selectedTask.statusText}
-                  </span>
-                </div>
-
-                {/* Action buttons based on status */}
-                <div className="button-group" style={{ marginTop: '1rem' }}>
-                  {selectedTask.status === STATUS.Open && selectedTask.creator?.toLowerCase() !== account.toLowerCase() && (
-                    <button
-                      onClick={() => handleTakeTask(selectedTask.id)}
-                      disabled={loading || wrongNetwork}
-                      className="btn-primary"
-                    >
-                      Take Task
-                    </button>
-                  )}
-
-                  {selectedTask.status === STATUS.InProgress && selectedTask.worker?.toLowerCase() === account.toLowerCase() && (
-                    <button
-                      onClick={() => handleSubmitWork(selectedTask.id)}
-                      disabled={loading || wrongNetwork}
-                      className="btn-success"
-                    >
-                      ✅ Submit Work for Review
-                    </button>
-                  )}
-
-                  {selectedTask.status === STATUS.PendingApproval && selectedTask.creator?.toLowerCase() === account.toLowerCase() && (
-                    <button
-                      onClick={() => handleApproveWork(selectedTask.id)}
-                      disabled={loading || wrongNetwork}
-                      className="btn-success"
-                    >
-                      ✅ Approve Work & Release Payment
-                    </button>
-                  )}
-
-                  {selectedTask.status === STATUS.Open && selectedTask.creator?.toLowerCase() === account.toLowerCase() && (
-                    <button
-                      onClick={() => handleCancelTask(selectedTask.id)}
-                      disabled={loading || wrongNetwork}
-                      className="btn-danger"
-                    >
-                      Cancel Task
-                    </button>
-                  )}
-                </div>
-              </div>
             </div>
           )}
 
@@ -1571,7 +1068,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* ✅ File upload input */}
+                {/* ✅ File attachments */}
                 <div className="form-group">
                   <label htmlFor="attachments">Attachments (optional, max 100MB each)</label>
                   <input
@@ -1582,14 +1079,13 @@ export default function App() {
                     disabled={wrongNetwork || uploadingFiles}
                   />
                   {attachments.length > 0 && (
-                    <ul className="attachments-list">
+                    <ul className="attachments-list"></ul>
                       {attachments.map((file, index) => (
-                        <li key={index}>
+                        <li key={index}></li>
                           {file.name} ({formatFileSize(file.size)})
                           <button
                             type="button"
                             onClick={() => removeAttachment(index)}
-                            className="btn-remove"
                             disabled={uploadingFiles}
                           >
                             ✕
@@ -1600,16 +1096,141 @@ export default function App() {
                   )}
                 </div>
 
-                <button type="submit" disabled={loading || wrongNetwork} className="btn-primary">
+                <button type="submit" disabled={loading || wrongNetwork} className="btn-primary"></button>
                   {loading ? "Creating..." : "Create Task"}
                 </button>
 
                 {wrongNetwork && (
-                  <div className="warning" style={{ marginTop: 12 }}>
+                  <div className="warning" style={{ marginTop: 12 }}></div>
                     Switch MetaMask to Sepolia to create tasks.
                   </div>
                 )}
               </form>
+            </div>
+          )}
+
+          {/* Task Detail */}
+          {currentView === "taskDetail" && selectedTask && (
+            <div className="task-detail"></div>
+              <button onClick={handleBackFromDetail} className="btn-back">
+                ← Back to Marketplace
+              </button>
+
+              <h2>Task Details</h2>
+
+              <div className="task-card">
+                <div className="task-header">
+                  <h3>{selectedTask.title}</h3>
+                  <span className="reward">💰 {selectedTask.reward} ETH</span>
+                </div>
+
+                <p className="description">{selectedTask.description}</p>
+
+                {/* ✅ Display attachments if they exist */}
+                {selectedTask.metadata?.attachments && selectedTask.metadata.attachments.length > 0 && (
+                  <div className="task-attachments"></div>
+                    <h4>📎 Attachments</h4>
+                    <ul>
+                      {selectedTask.metadata.attachments.map((att, idx) => (
+                        <li key={idx}></li>
+                          <span>📄 {att.name}</span>
+                          <a 
+                            href={`https://w3s.link/ipfs/${att.cid}`} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                          >
+                            View
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="task-meta"></div>
+                  <span>📅 Deadline: {formatDateTime(selectedTask.deadline)}</span>
+                  <span>👤 Creator: {formatAddress(selectedTask.creator)}</span>
+                  {selectedTask.worker && (
+                    <span>👷 Worker: {formatAddress(selectedTask.worker)}</span>
+                  )}
+                </div>
+
+                <div className="task-actions"></div>
+                  {selectedTask.status === STATUS.Open && (
+                    <button
+                      onClick={() => handleTakeTask(selectedTask.id)}
+                      disabled={loading || wrongNetwork}
+                      className="btn-primary"
+                    >
+                      Take Task
+                    </button>
+                  )}
+
+                  {selectedTask.status === STATUS.PendingApproval && (
+                    <button
+                      onClick={() => handleApproveWork(selectedTask.id)}
+                      disabled={loading || wrongNetwork}
+                      className="btn-success"
+                    ></button>
+                      ✅ Approve Work & Release Payment
+                    </button>
+                  )}
+
+                  {selectedTask.status === STATUS.InProgress && (
+                    <button
+                      onClick={() => handleSubmitWork(selectedTask.id)}
+                      disabled={loading || wrongNetwork}
+                      className="btn-success"
+                    >
+                      ✅ Submit Work for Review
+                    </button>
+                  )}
+
+                  {selectedTask.status === STATUS.Cancelled && (
+                    <div className="completion-message">🚫 Cancelled</div>
+                  )}
+
+                  {selectedTask.status === STATUS.Completed && (
+                    <div className="completion-message">✅ Completed & approved</div>
+                  )}
+                </div>
+
+                {/* Comments */}
+                <div className="comments-section">
+                  <h4>Comments</h4>
+                  {comments[selectedTask.id]?.length > 0 ? (
+                    <ul className="comments-list"></ul>
+                      {comments[selectedTask.id].map((comment, idx) => (
+                        <li key={idx}></li>
+                          <span className="comment-author">{formatAddress(comment.author)}</span>
+                          <span className="comment-message">{comment.message}</span>
+                          <span className="comment-timestamp">{formatDateTime(comment.timestamp)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>No comments yet.</p>
+                  )}
+
+                  <div className="add-comment">
+                    <textarea
+                      value={commentInput[selectedTask.id] || ""}
+                      onChange={(e) =>
+                        setCommentInput((prev) => ({ ...prev, [selectedTask.id]: e.target.value }))
+                      }
+                      placeholder="Add a comment..."
+                      rows={3}
+                    />
+                    <button
+                      onClick={() => handleAddComment(selectedTask.id)}
+                      disabled={loading || !commentInput[selectedTask.id]}
+                      className="btn-primary"
+                    >
+                      Add Comment
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </main>

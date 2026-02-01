@@ -1,6 +1,7 @@
 {
-  "address": "0xb8C33d85C8Ba7464165D20d389190121B1f9472C",
+  "taskMarketplace": "0x5D533ccf3765aeba0d5bdfeBfc08AdD1AECBb8C5",
+  "taskLibrary": "0x88034b012FA1138e3821889ba44727a80475Fe4D",
   "network": "sepolia",
   "deployer": "0x9BEd09A84DdA543AC63Dcf981CD9d92f1ABCc7DF",
-  "timestamp": "2026-01-15T10:18:13.998Z"
+  "timestamp": "2026-02-01T16:18:46.789Z"
 }

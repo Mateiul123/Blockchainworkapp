@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
 import TaskMarketplaceArtifact from "../contracts/TaskMarketplace.json";
+import { uploadTaskMetadata, fetchFromIPFS, isIPFSCID } from "./ipfsUtils";
 
 const ABI = TaskMarketplaceArtifact.abi;
 
@@ -103,24 +104,25 @@ export default class TaskMarketplaceUtils {
     this._on("TaskCreated", cb);
   }
   onTaskTaken(cb) {
-    // V2: worker accepted
+    // ✅ V2 contract uses "WorkerAccepted" instead of "TaskTaken"
     this._on("WorkerAccepted", cb);
   }
   onWorkSubmitted(cb) {
     this._on("WorkSubmitted", cb);
   }
   onTaskApproved(cb) {
+    // ✅ V2 contract uses "WorkApproved" instead of "TaskApproved"
     this._on("WorkApproved", cb);
-    this._on("WorkAutoApproved", cb);
   }
   onTaskCancelled(cb) {
     this._on("TaskCancelled", cb);
-    this._on("TaskExpired", cb);
   }
   onTaskComment(cb) {
-    this._on("TaskComment", (taskId, author, message, timestamp) => {
-      cb({ taskId: Number(taskId), author, message, timestamp: Number(timestamp) });
-    });
+    // ✅ Comment event doesn't exist in this contract version
+    // Commenting out to prevent errors
+    // this._on("TaskComment", (taskId, author, message, timestamp) => {
+    //   cb({ taskId: Number(taskId), author, message, timestamp: Number(timestamp) });
+    // });
   }
 
   // ---- Helpers ----
@@ -157,7 +159,30 @@ export default class TaskMarketplaceUtils {
     try {
       if (!this.contractRead) return { success: false, error: "Not connected" };
       const t = await this.contractRead.getTask(BigInt(taskId));
-      return { success: true, task: this._normalizeTask(t) };
+      const normalized = this._normalizeTask(t);
+      
+      console.log('Raw task from blockchain:', normalized);
+      
+      // ✅ Try to fetch IPFS metadata if metadataCID looks like a CID
+      if (isIPFSCID(normalized.metadataCID)) {
+        console.log('Attempting to fetch metadata from IPFS:', normalized.metadataCID);
+        try {
+          const metadata = await fetchFromIPFS(normalized.metadataCID);
+          console.log('Fetched metadata from IPFS:', metadata);
+          if (metadata) {
+            normalized.metadata = metadata;
+            normalized.description = metadata.description || normalized.metadataCID;
+          } else {
+            console.warn('Metadata fetch returned null for:', normalized.metadataCID);
+          }
+        } catch (e) {
+          console.error(`Failed to fetch IPFS metadata for task ${taskId}:`, e);
+        }
+      } else {
+        console.log('metadataCID is not a valid CID:', normalized.metadataCID);
+      }
+      
+      return { success: true, task: normalized };
     } catch (e) {
       return { success: false, error: e?.message || String(e) };
     }
@@ -176,8 +201,10 @@ export default class TaskMarketplaceUtils {
   async _getTasksFromIds(ids) {
     const tasks = [];
     for (const id of ids) {
-      const t = await this.contractRead.getTask(BigInt(id));
-      tasks.push(this._normalizeTask(t));
+      const result = await this.getTask(id);
+      if (result.success) {
+        tasks.push(result.task);
+      }
     }
     // newest first
     tasks.sort((a, b) => Number(b.id) - Number(a.id));
@@ -209,25 +236,194 @@ export default class TaskMarketplaceUtils {
   async getAllOpenTasks() {
     try {
       if (!this.contractRead) return { success: false, error: "Not connected" };
+      
+      console.log('🔍 Fetching tasks from contract:', this.contractAddress);
       const total = await this.contractRead.getTotalTasks();
       const n = Number(total);
+      console.log(`📊 Total tasks in contract: ${n}`);
+      
       const tasks = [];
       for (let id = 1; id <= n; id++) {
-        const t = await this.contractRead.getTask(BigInt(id));
-        const norm = this._normalizeTask(t);
-        if (norm.status === 0) tasks.push(norm);
+        const result = await this.getTask(id);
+        if (result.success && result.task.status === 0) {
+          console.log(`✅ Found open task #${id}:`, result.task.title);
+          tasks.push(result.task);
+        }
       }
       tasks.sort((a, b) => Number(b.id) - Number(a.id));
+      console.log(`✅ Returning ${tasks.length} open tasks`);
       return { success: true, tasks };
     } catch (e) {
+      console.error('❌ Error fetching tasks:', e);
       return { success: false, error: e?.message || String(e) };
     }
   }
 
   // ---- Actions ----
-  // Backward-compatible helper: App.jsx calls createTask(title, description, deliveryDeadlineTs, rewardEth)
-  // We map to V2 createTask(title, metadataCID, category, tagsHash, applyDeadline, deliveryDeadline)
-  async createTask(title, descriptionOrCid, deliveryDeadlineTs, rewardEth) {
+  // ✅ GAS ESTIMATION METHODS - Call before transactions to show user the cost
+  async estimateGasForCreateTask(title, descriptionOrCid, deliveryDeadlineTs, rewardEth, additionalMetadata = {}) {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+
+      const now = Math.floor(Date.now() / 1000);
+      const delivery = Number(deliveryDeadlineTs);
+      const value = ethers.parseEther(String(rewardEth));
+
+      let metadataCID = descriptionOrCid;
+      if (!isIPFSCID(descriptionOrCid)) {
+        const metadata = {
+          description: descriptionOrCid,
+          title,
+          createdAt: new Date().toISOString(),
+          ...additionalMetadata,
+        };
+        metadataCID = await uploadTaskMetadata(metadata);
+      }
+
+      const category = 0;
+      const tagsHash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+      const applyDeadline = now + (7 * 24 * 60 * 60);
+
+      const gasEstimate = await this.contractWrite.createTask.estimateGas(
+        title,
+        String(metadataCID),
+        category,
+        tagsHash,
+        BigInt(applyDeadline),
+        BigInt(delivery),
+        { value }
+      );
+
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+      const totalCostEth = parseFloat(gasCostEth) + parseFloat(rewardEth);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+        rewardEth,
+        totalCostEth: totalCostEth.toFixed(6),
+        metadataCID
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  async estimateGasForTakeTask(taskId) {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+      
+      const gasEstimate = await this.contractWrite.applyToTask.estimateGas(BigInt(taskId));
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  async estimateGasForSubmitWork(taskId, submissionCID) {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+      
+      const gasEstimate = await this.contractWrite.submitWork.estimateGas(
+        BigInt(taskId), 
+        String(submissionCID ?? "")
+      );
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  async estimateGasForApproveWork(taskId) {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+      
+      const gasEstimate = await this.contractWrite.approveWork.estimateGas(BigInt(taskId));
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  async estimateGasForCancelTask(taskId) {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+      
+      const gasEstimate = await this.contractWrite.cancelTask.estimateGas(BigInt(taskId));
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  async estimateGasForWithdraw() {
+    try {
+      if (!this.contractWrite) return { success: false, error: "Not connected" };
+      
+      const gasEstimate = await this.contractWrite.withdraw.estimateGas();
+      const feeData = await this.provider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits("20", "gwei");
+      const gasCostWei = gasEstimate * gasPrice;
+      const gasCostEth = ethers.formatEther(gasCostWei);
+
+      return {
+        success: true,
+        gasEstimate: gasEstimate.toString(),
+        gasCostEth,
+        gasPrice: ethers.formatUnits(gasPrice, "gwei"),
+      };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  // ✅ Updated to match V2 contract: createTask(title, metadataCID, category, tagsHash, applyDeadline, deliveryDeadline)
+  async createTask(title, descriptionOrCid, deliveryDeadlineTs, rewardEth, additionalMetadata = {}) {
     try {
       if (!this.contractWrite) return { success: false, error: "Not connected" };
 
@@ -237,44 +433,90 @@ export default class TaskMarketplaceUtils {
         return { success: false, error: "Delivery deadline must be in the future" };
       }
 
-      // apply deadline: at most delivery - 1 hour, but at least now + 10 minutes
-      const apply = Math.max(now + 600, Math.min(delivery - 3600, delivery - 600));
-
       const value = ethers.parseEther(String(rewardEth));
-      const tagsHash = "0x" + "0".repeat(64);
-      const category = 0;
 
-      const tx = await this.contractWrite.createTask(
-        title,
-        String(descriptionOrCid ?? ""),
-        Number(category),
-        tagsHash,
-        BigInt(apply),
-        BigInt(delivery),
-        { value }
-      );
+      let metadataCID = descriptionOrCid;
 
-      const receipt = await tx.wait();
-      // Try to read TaskCreated(taskId, ...) from logs for nicer UI messages
-      let taskId = null;
-      try {
-        for (const log of receipt?.logs || []) {
-          const parsed = this.contractRead?.interface?.parseLog?.(log);
-          if (parsed?.name === "TaskCreated") {
-            taskId = Number(parsed.args?.[0]);
-            break;
-          }
+      // ✅ If description is not already a CID, upload it to IPFS
+      if (!isIPFSCID(descriptionOrCid)) {
+        try {
+          const metadata = {
+            description: descriptionOrCid,
+            title,
+            createdAt: new Date().toISOString(),
+            ...additionalMetadata,
+          };
+          
+          metadataCID = await uploadTaskMetadata(metadata);
+          console.log("Task metadata uploaded to IPFS:", metadataCID);
+        } catch (ipfsError) {
+          console.warn("IPFS upload failed, using plain text:", ipfsError);
+          // Fall back to plain text if IPFS fails
+          metadataCID = descriptionOrCid;
         }
-      } catch {
-        // ignore
       }
 
-      return {
-        success: true,
-        taskId,
-        hash: tx.hash,
-        gasUsed: receipt?.gasUsed?.toString?.(),
-      };
+      // ✅ V2 contract parameters: (title, metadataCID, category, tagsHash, applyDeadline, deliveryDeadline)
+      const category = 0; // Default category (you can make this configurable later)
+      const tagsHash = "0x0000000000000000000000000000000000000000000000000000000000000000"; // Empty bytes32
+      const applyDeadline = now + (7 * 24 * 60 * 60); // 7 days from now (you can make this configurable)
+      
+      console.log("Creating task with params:", {
+        title,
+        metadataCID: String(metadataCID),
+        category,
+        tagsHash,
+        applyDeadline,
+        delivery,
+      });
+      
+      try {
+        const tx = await this.contractWrite.createTask(
+          title,
+          String(metadataCID),
+          category,
+          tagsHash,
+          BigInt(applyDeadline),
+          BigInt(delivery),
+          { value }
+        );
+
+        console.log("Transaction sent:", tx.hash);
+
+        const receipt = await tx.wait();
+        
+        // Try to read TaskCreated(taskId, ...) from logs
+        let taskId = null;
+        try {
+          for (const log of receipt?.logs || []) {
+            const parsed = this.contractRead?.interface?.parseLog?.(log);
+            if (parsed?.name === "TaskCreated") {
+              taskId = Number(parsed.args?.[0]);
+              break;
+            }
+          }
+        } catch {
+          // ignore
+        }
+
+        return {
+          success: true,
+          taskId,
+          metadataCID,
+          hash: tx.hash,
+          gasUsed: receipt?.gasUsed?.toString?.(),
+        };
+      } catch (contractError) {
+        console.error("Contract call failed:", contractError);
+        const errorMessage = contractError?.reason || contractError?.message || String(contractError);
+        console.error("Error details:", {
+          reason: contractError?.reason,
+          code: contractError?.code,
+          message: contractError?.message,
+          data: contractError?.data,
+        });
+        return { success: false, error: `Contract error: ${errorMessage}` };
+      }
     } catch (e) {
       return { success: false, error: e?.shortMessage || e?.message || String(e) };
     }
